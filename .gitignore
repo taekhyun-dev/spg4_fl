@@ -1,8 +1,8 @@
 PyTorch 데이터셋 폴더
-/data/
+./data/
 
 시뮬레이션 로그 폴더
-/logs/
+./logs/
 
 Python 캐시 파일 및 폴더
 pycache/
