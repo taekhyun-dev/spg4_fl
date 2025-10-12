@@ -117,7 +117,8 @@ class WorkerSatellite(Satellite):
                         self.logger.info(f"🛰️  WorkerSAT {self.sat_id}가 IoT 클러스터 '{iot.name}' 상공 통과 (고도각: {elevation:.2f}°). 학습 시작.")
                         asyncio.create_task(self.train_local_model())
                         break 
-            await asyncio.sleep(10)
+            # await asyncio.sleep(10)
+            await asyncio.sleep(0.5)
 
 class MasterSatellite(Satellite):
     """
@@ -154,7 +155,8 @@ class MasterSatellite(Satellite):
                         await self.send_model_to_worker(worker)
                     if worker.model_ready_to_upload:
                         await self.receive_model_from_worker(worker)
-            await asyncio.sleep(10)
+            # await asyncio.sleep(10)
+            await asyncio.sleep(1)
 
     async def receive_global_model(self, model: PyTorchModel):
         """지상국으로부터 글로벌 모델을 수신"""
@@ -181,7 +183,8 @@ class MasterSatellite(Satellite):
     async def aggregate_models_periodically(self):
         """주기적으로 버퍼에 쌓인 워커 모델들을 취합"""
         while True:
-            await asyncio.sleep(30)
+            # await asyncio.sleep(30)
+            await asyncio.sleep(2)
             if not self.cluster_model_buffer:
                 continue
             await self._aggregate_and_evaluate_cluster_models()
