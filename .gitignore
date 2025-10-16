@@ -1,5 +1,7 @@
 PyTorch 데이터셋 폴더
 /data/
+/OLD/data/
+/OLD/logs/
 
 시뮬레이션 로그 폴더
 /logs/

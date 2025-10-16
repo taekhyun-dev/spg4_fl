@@ -1,14 +1,16 @@
 # simulation/environment.py
 import asyncio
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 from skyfield.api import Topos
 
-from config import MIN_MODELS_FOR_AGGREGATION, AGGREGATION_STALENESS_THRESHOLD
-from ml.model import PyTorchModel
+from config import MIN_MODELS_FOR_AGGREGATION, AGGREGATION_STALENESS_THRESHOLD, NUM_MASTERS, SATS_PER_PLANE
+from ml.model import PyTorchModel, create_mobilenet
 from ml.training import evaluate_model, fed_avg
 from utils.logging_setup import KST
+from utils.skyfield_utils import EarthSatellite
+from simulation.satellite import Satellite, WorkerSatellite, MasterSatellite
 
 class IoTCluster:
     """데이터 소스가 되는 IoT 클러스터를 나타내는 클래스"""
@@ -65,7 +67,7 @@ class GroundStation:
                     if sat.model_ready_to_upload:
                         await self.receive_model_from_satellite(sat)
                         # 수신 직후 바로 집계 시도하여 모델 즉시 업데이트
-                        await self.try_aggregate_and_update()
+                        # await self.try_aggregate_and_update()
                     
                     # 2. 그 다음 송신
                     await self.send_model_to_satellite(sat)
@@ -79,8 +81,9 @@ class GroundStation:
             await asyncio.sleep(clock.real_interval)
 
     async def send_model_to_satellite(self, satellite: 'MasterSatellite'):
-        self.logger.info(f"  📤 {self.name} -> MasterSAT {satellite.sat_id}: 글로벌 모델 전송 (버전 {self.global_model.version})")
-        await satellite.receive_global_model(self.global_model)
+        if self.global_model.version > satellite.local_model.version:
+            self.logger.info(f"  📤 {self.name} -> MasterSAT {satellite.sat_id}: 글로벌 모델 전송 (버전 {self.global_model.version})")
+            await satellite.receive_global_model(self.global_model)
 
     async def receive_model_from_satellite(self, satellite: 'MasterSatellite'):
         cluster_model = await satellite.send_local_model()
@@ -91,8 +94,9 @@ class GroundStation:
     async def periodic_aggregation_task(self):
         """주기적으로 Aggregation을 시도하는 백그라운드 작업"""
         while True:
-            await asyncio.sleep(30)
+            # self.logger.info(f"🕒 [{self.name}] Aggregation 조건 확인 중...")
             await self.try_aggregate_and_update()
+            await asyncio.sleep(5) # 30초 -> 5초로 단축하여 더 자주 확인
             
     async def try_aggregate_and_update(self):
         """Aggregation 조건 확인 및 수행"""
@@ -120,7 +124,8 @@ class GroundStation:
         self.global_model = PyTorchModel(version=new_version, model_state_dict=new_state_dict, trained_by=all_contributors)
         self.logger.info(f"✨ [{self.name} Aggregation] 새로운 글로벌 모델 생성 완료! (버전 {self.global_model.version})")
 
-        accuracy, loss = evaluate_model(self.global_model.model_state_dict, self.test_loader, self.device)
+        loop = asyncio.get_running_loop()
+        accuracy, loss = await loop.run_in_executor(None, evaluate_model, self.global_model.model_state_dict, self.test_loader, self.device)
         self.logger.info(f"  🧪 [Global Test] Owner: {self.name}, Version: {self.global_model.version}, Accuracy: {accuracy:.2f}%, Loss: {loss:.4f}")
         self.perf_logger.info(f"{datetime.now(KST).isoformat()},GLOBAL_TEST,{self.name},{self.global_model.version},N/A,{accuracy:.4f},{loss:.6f}")
 
@@ -138,3 +143,67 @@ class GroundStation:
                     discard_model_ids = {id(m) for m in models_to_discard}
                     self.received_models_buffer = [m for m in self.received_models_buffer if id(m) not in discard_model_ids]
             except ValueError: pass
+
+def create_simulation_environment(
+    clock: 'SimulationClock', 
+    eval_infra: dict, 
+    all_sats_skyfield: Dict[int, EarthSatellite]
+) -> Tuple[Dict[int, Satellite], List[GroundStation]]:
+    """
+    시뮬레이션 환경을 구성하는 모든 객체(위성, 지상국, IoT)를 생성합니다.
+    main.py에서 TLE 로딩 후, 이 함수를 호출하여 환경을 구성합니다.
+    """
+    logger = eval_infra['sim_logger']
+    
+    # 1. 초기 글로벌 모델 생성
+    initial_pytorch_model = create_mobilenet()
+    initial_global_model = PyTorchModel(version=0, model_state_dict=initial_pytorch_model.state_dict())
+    
+    # 2. 지상국 및 IoT 클러스터 생성
+    ground_stations = [
+        GroundStation("Seoul-GS", 37.5665, 126.9780, 34, initial_model=initial_global_model, eval_infra=eval_infra),
+        # GroundStation("Houston-GS", 29.7604, -95.3698, 12, initial_model=initial_global_model, eval_infra=eval_infra)
+    ]
+    
+    iot_clusters = [
+        IoTCluster("Amazon_Forest", -3.47, -62.37, 100, sim_logger=logger),
+        IoTCluster("Great_Barrier_Reef", -18.29, 147.77, 0, sim_logger=logger),
+        IoTCluster("Siberian_Tundra", 68.35, 18.79, 420, sim_logger=logger)
+    ]
+
+    # 3. 위성 객체 및 클러스터 구성 (기존 main.py 로직)
+    satellites_in_sim: Dict[int, Satellite] = {}
+    sat_ids = sorted(list(all_sats_skyfield.keys()))
+    
+    if len(sat_ids) < NUM_MASTERS * (SATS_PER_PLANE // NUM_MASTERS if NUM_MASTERS > 0 else SATS_PER_PLANE):
+       raise ValueError(f"시뮬레이션을 위해 충분한 수의 위성 TLE가 필요합니다.")
+       
+    master_ids = [sat_ids[i * SATS_PER_PLANE] for i in range(NUM_MASTERS)]
+    worker_ids = [sid for sid in sat_ids if sid not in master_ids]
+    
+    logger.info(f"마스터 위성으로 {master_ids}가 선정되었습니다.")
+
+    masters = []
+    for m_id in master_ids:
+        master_sat = MasterSatellite(
+            m_id, all_sats_skyfield[m_id], clock,
+            initial_model=initial_global_model,
+            iot_clusters=iot_clusters, eval_infra=eval_infra
+        )
+        satellites_in_sim[m_id] = master_sat
+        masters.append(master_sat)
+
+    for i, w_id in enumerate(worker_ids):
+        assigned_master = masters[i % NUM_MASTERS]
+        worker_sat = WorkerSatellite(
+            w_id, all_sats_skyfield[w_id], clock,
+            initial_model=initial_global_model,
+            iot_clusters=iot_clusters,
+            master=assigned_master, eval_infra=eval_infra
+        )
+        assigned_master.add_member(worker_sat)
+        satellites_in_sim[w_id] = worker_sat
+            
+    logger.info(f"총 {len(satellites_in_sim)}개 위성 생성 완료. ({len(masters)} Masters, {len(satellites_in_sim) - len(masters)} Workers)")
+    
+    return satellites_in_sim, ground_stations    
